@@ -1,5 +1,5 @@
-ComfyUI_windows_portable/ComfyUI/
-ComfyUI_windows_portable/python_embeded/
+python_embeded/
+pretrained_models/
 rvm/models/
 __pycache__/
 *.pyc
