@@ -1,5 +1,5 @@
 python_embeded/
-pretrained_models/
+matanyone2/pretrained_models/
 rvm/models/
 __pycache__/
 *.pyc
