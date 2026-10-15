@@ -1,5 +1,19 @@
-python_embeded/
-matanyone2/pretrained_models/
-rvm/models/
+# 忽略便携 Python 环境与压缩包 (走 GitHub Releases 分发)
+/python_embeded/
+*.7z*
+*.zip
+*.rar
+
+# 忽略超过 100MB 的模型权重文件 (.pth)
+/matanyone2/pretrained_models/*.pth
+/rvm/models/*.pth
+*.ckpt
+*.safetensors
+
+# 忽略缓存与临时文件
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+Thumbs.db
+.DS_Store
+_run_ai_progress.bat
