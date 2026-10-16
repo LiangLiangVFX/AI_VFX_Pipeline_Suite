@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-MatAnyone 2 (CVPR 2026) 拆帧序列抠像执行器 (GPU 内存直通极速版)
-- 强制 UTF-8 标准输出，杜绝 Windows GBK 编码报错
-- 支持首帧 Roto 增删/排除/合并模块区域
-- 支持 --start_at 从任意指定帧开始局部重算补救（保留前面已抠好的帧）
+MatAnyone 2 (CVPR 2026) 拆帧序列抠像执行器 (BiRefNet + RVM 双引导保底版)
+- 100% 保留原有 RVM 首帧引导逻辑，支持随时切换或异常自动回退保底
+- 新增 BiRefNet_HR-matting 首帧引导，连人带手中道具/武器一次性高清提取
 """
 import os
 import re
@@ -53,14 +52,14 @@ sys.path.insert(0, CURRENT_DIR)
 
 
 def get_rvm_first_frame_mask(first_img_path, device):
-    """调用本地 RVM 提取引导帧人物初始遮罩"""
+    """【原版保底】调用本地 RVM 提取引导帧人物初始遮罩"""
     rvm_dir = os.path.join(SUITE_ROOT, "rvm")
     rvm_ckpt = os.path.join(rvm_dir, "models", "rvm_resnet50.pth")
     if rvm_dir not in sys.path:
         sys.path.insert(0, rvm_dir)
     from model import MattingNetwork
 
-    print(">> [1/3] 正在使用 RVM 提取引导帧人形基础遮罩...")
+    print(">> [1/3] 正在使用 [RVM 原版引擎] 提取引导帧人形基础遮罩...")
     model = MattingNetwork('resnet50').to(device).eval()
     model.load_state_dict(torch.load(rvm_ckpt, map_location=device))
 
@@ -72,8 +71,49 @@ def get_rvm_first_frame_mask(first_img_path, device):
     return mask_np, img.size
 
 
-def build_guided_first_mask(first_img_path, user_mask_path, mask_mode, save_mask_path, device):
-    """根据所选模式合成引导帧遮罩"""
+def get_birefnet_first_frame_mask(first_img_path, device):
+    """【升级引擎】调用本地 BiRefNet_HR-matting 提取引导帧高清人物+随身道具遮罩（失败自动回退 RVM）"""
+    biref_dir = os.path.join(SUITE_ROOT, "birefnet", "models", "BiRefNet_HR-matting")
+    safetensor_path = os.path.join(biref_dir, "model.safetensors")
+    if not os.path.exists(safetensor_path):
+        print(">> [提示] 未检测到 BiRefNet 权重，自动无缝回退至原版 RVM 引擎...")
+        return get_rvm_first_frame_mask(first_img_path, device)
+
+    try:
+        from transformers import AutoModelForImageSegmentation
+        print(">> [1/3] 正在使用 [BiRefNet 高清引擎] 提取引导帧前景 (人+随身道具)...")
+        birefnet = AutoModelForImageSegmentation.from_pretrained(
+            biref_dir, trust_remote_code=True, local_files_only=True
+        ).to(device).eval()
+        if device == "cuda":
+            birefnet.half()
+
+        img = Image.open(first_img_path).convert("RGB")
+        orig_size = img.size
+        tfm = transforms.Compose([
+            transforms.Resize((1024, 1024)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        inp_t = tfm(img).unsqueeze(0).to(device)
+        if device == "cuda":
+            inp_t = inp_t.half()
+
+        with torch.no_grad():
+            preds = birefnet(inp_t)[-1].sigmoid().cpu().float()
+        pred_pil = transforms.ToPILImage()(preds[0].squeeze(0)).resize(orig_size, Image.BILINEAR)
+        mask_np = ((np.array(pred_pil) > 64) * 255).astype(np.uint8)
+        del birefnet
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return mask_np, orig_size
+    except Exception as e:
+        print(f">> [提示] BiRefNet 引导发生异常 ({e})，自动无缝回退至原版 RVM 引擎...")
+        return get_rvm_first_frame_mask(first_img_path, device)
+
+
+def build_guided_first_mask(first_img_path, user_mask_path, mask_mode, guide_engine, save_mask_path, device):
+    """根据所选模式与所选引导引擎合成引导帧遮罩"""
     has_user_mask = bool(user_mask_path and os.path.exists(user_mask_path))
 
     if mask_mode == "replace" and has_user_mask:
@@ -84,27 +124,30 @@ def build_guided_first_mask(first_img_path, user_mask_path, mask_mode, save_mask
         print(">> [引导模式] 完全按 Nuke Roto 区域")
         return u_np
 
-    rvm_np, (src_w, src_h) = get_rvm_first_frame_mask(first_img_path, device)
+    if guide_engine == "birefnet":
+        base_np, (src_w, src_h) = get_birefnet_first_frame_mask(first_img_path, device)
+    else:
+        base_np, (src_w, src_h) = get_rvm_first_frame_mask(first_img_path, device)
 
     if not has_user_mask or mask_mode == "auto":
-        Image.fromarray(rvm_np, mode="L").save(save_mask_path, "PNG")
-        print(">> [引导模式] 全自动只抠人")
-        return rvm_np
+        Image.fromarray(base_np, mode="L").save(save_mask_path, "PNG")
+        print(f">> [引导模式] 全自动提取主体 (引擎: {guide_engine})")
+        return base_np
 
     u_img = Image.open(user_mask_path).convert("L").resize((src_w, src_h), Image.NEAREST)
     u_np = ((np.array(u_img) > 127) * 255).astype(np.uint8)
 
     if mask_mode == "intersect":
-        final_np = np.minimum(rvm_np, u_np)
-        print(">> [引导模式] 只保留 Roto 圈内的人 (排除圈外)")
+        final_np = np.minimum(base_np, u_np)
+        print(">> [引导模式] 只保留 Roto 圈内的主体 (排除圈外)")
     elif mask_mode == "subtract":
-        final_np = np.where(u_np > 127, 0, rvm_np).astype(np.uint8)
-        print(">> [引导模式] 从人身上挖掉 Roto 区域 (局部排除)")
+        final_np = np.where(u_np > 127, 0, base_np).astype(np.uint8)
+        print(">> [引导模式] 从主体上挖掉 Roto 区域 (局部排除)")
     elif mask_mode == "union":
-        final_np = np.maximum(rvm_np, u_np)
-        print(">> [引导模式] 人 + Roto 模块区域 (合并跟踪)")
+        final_np = np.maximum(base_np, u_np)
+        print(">> [引导模式] 主体 + Roto 模块区域 (合并跟踪)")
     else:
-        final_np = rvm_np
+        final_np = base_np
 
     Image.fromarray(final_np, mode="L").save(save_mask_path, "PNG")
     return final_np
@@ -134,6 +177,7 @@ def main():
     parser.add_argument("--output", required=True, help="输出文件夹路径")
     parser.add_argument("--mask", default="", help="Nuke 导出的引导帧 Roto 遮罩路径")
     parser.add_argument("--mask_mode", default="auto", choices=["auto", "intersect", "subtract", "union", "replace"])
+    parser.add_argument("--guide_engine", default="birefnet", choices=["birefnet", "rvm"], help="首帧引导引擎 (birefnet 或 rvm)")
     parser.add_argument("--prefix", default="matanyone2", help="输出文件名前缀")
     parser.add_argument("--warmup", type=int, default=10, help="首帧发丝精修迭代次数")
     parser.add_argument("--erode_kernel", type=int, default=10)
@@ -163,7 +207,6 @@ def main():
     m_first = re.search(r'(\d+)\.[^.]+$', all_files[0])
     seq_first_frame = int(m_first.group(1)) if m_first else 1001
 
-    # 如果指定了 --start_at (例如从 1015 帧开始补救)，只截取从该帧开始的序列进行推理，保留前面的好帧
     offset_idx = 0
     if args.start_at > seq_first_frame:
         offset_idx = min(args.start_at - seq_first_frame, len(all_files) - 1)
@@ -174,11 +217,13 @@ def main():
     if offset_idx > 0:
         print(f"• [局部补救模式] 保留 {seq_first_frame}~{start_frame - 1} 帧，仅从第 {start_frame} 帧开始往后重算！")
 
-    # 1. 生成引导遮罩
+    # 1. 生成引导遮罩 (支持 BiRefNet 或 RVM，且失败自动回退保底)
     first_frame_path = os.path.join(input_dir, files[0])
     guided_mask_file = os.path.join(output_dir, f"_guided_frame_{start_frame}_mask.png")
     user_mask = args.mask.strip().strip('"') if args.mask else ""
-    mask_np = build_guided_first_mask(first_frame_path, user_mask, args.mask_mode, guided_mask_file, device)
+    mask_np = build_guided_first_mask(
+        first_frame_path, user_mask, args.mask_mode, args.guide_engine, guided_mask_file, device
+    )
 
     # 2. 如果是从头跑全片，清理旧文件；如果是局部补救，直接覆盖对应帧号的文件
     if offset_idx == 0:

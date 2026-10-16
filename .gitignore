@@ -7,6 +7,9 @@
 # 忽略超过 100MB 的模型权重文件 (.pth)
 /matanyone2/pretrained_models/*.pth
 /rvm/models/*.pth
+/birefnet/models/**/*.safetensors
+/birefnet/models/**/*.pth
+/sam2matting/checkpoints/*.pt
 *.ckpt
 *.safetensors
 
