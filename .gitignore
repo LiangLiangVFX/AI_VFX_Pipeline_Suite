@@ -11,6 +11,7 @@
 /birefnet/models/**/*.safetensors
 /birefnet/models/**/*.pth
 /sam2matting/checkpoints/*.pt
+/depth_pro/checkpoints/*.pt
 *.ckpt
 *.safetensors
 
